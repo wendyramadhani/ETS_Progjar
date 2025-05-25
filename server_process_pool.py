@@ -1,115 +1,155 @@
 from socket import *
 import socket
+import threading
 import logging
 import time
 import sys
-import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor # Or ProcessPoolExecutor
 
 # Asumsi file_protocol.py ada dan berisi kelas FileProtocol
+# yang memiliki metode proses_string(message)
 from file_protocol import FileProtocol
 
 # Konfigurasi logging
-logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - [PID:%(process)d] - %(message)s')
+logging.basicConfig(level=logging.WARNING,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ClientHandler:
     """
     Kelas ini menangani komunikasi dengan satu klien.
-    Akan dijalankan oleh ProcessPoolExecutor di dalam proses worker terpisah.
     """
-    def __init__(self):
-        logging.debug(f"ClientHandler __init__ called in process {os.getpid()}")
-        try:
-            self.fp = FileProtocol()
-            logging.debug(f"FileProtocol instance created successfully in process {os.getpid()}")
-        except Exception as e:
-            logging.critical(f"ERROR: Failed to create FileProtocol instance in process {os.getpid()}: {e}", exc_info=True)
-            raise
+    def __init__(self, connection, address, server_stats): # Tambahkan server_stats sebagai argumen
+        self.connection = connection
+        self.address = address
+        self.fp = FileProtocol() # Setiap handler memiliki instance FileProtocol-nya sendiri
+        self.server_stats = server_stats # Referensi ke objek statistik server
+        logging.info(f"Client handler created for {address}")
 
-    def run(self, conn_fileno, address): # Menerima fileno, bukan connection object
+    def run(self):
         """
         Metode ini berisi logika untuk memproses data dari klien.
-        Menerima file descriptor koneksi dan alamat klien.
         """
-        # Rekonstruksi socket dari file descriptor di dalam proses worker
-        connection = socket.fromfd(conn_fileno, socket.AF_INET, socket.SOCK_STREAM)
-        connection.setblocking(True) # Pastikan socket berada dalam mode blocking
-        # Penting: Tutup fileno asli karena socket.fromfd membuat duplikat
-        # Namun, untuk soket yang diterima dari accept(), fileno-nya sudah valid
-        # dan akan ditutup saat connection.close() dipanggil.
-
-        logging.warning(f"Starting to process client {address} in process {os.getpid()}")
         buffer = ""
         try:
+            logging.warning(f"Starting to process client {self.address}")
             while True:
-                data = connection.recv(4096)
+                data = self.connection.recv(4096)
                 if not data:
-                    logging.warning(f"Client {address} disconnected gracefully (PID:{os.getpid()}).")
+                    logging.warning(f"Client {self.address} disconnected gracefully.")
                     break
 
                 buffer += data.decode('utf-8')
 
                 while "\r\n\r\n" in buffer:
                     message, buffer = buffer.split("\r\n\r\n", 1)
-                    logging.info(f"Received message from {address} (PID:{os.getpid()}): {message[:100]}...")
-                     
+                    logging.info(f"Received message from {self.address}: {message[:50]}...")
+                    
+                    # === START: Handle GET_SERVER_STATS command ===
+                    if message.strip() == "GET_SERVER_STATS":
+                        with self.server_stats['lock']:
+                            stats_response = (
+                                f"SERVER_STATS_SUCCESS:{self.server_stats['successful_operations']}"
+                                f"\r\nSERVER_STATS_FAILED:{self.server_stats['failed_operations']}"
+                            )
+                        stats_response += "\r\n\r\n" # Always end with separator
+                        self.connection.sendall(stats_response.encode('utf-8'))
+                        logging.info(f"Sent server stats to {self.address}")
+                        # After sending stats, gracefully close this connection
+                        return # Exit run method for this special request
+                    # === END: Handle GET_SERVER_STATS command ===
+
+                    # Original file protocol processing
                     hasil = self.fp.proses_string(message)
                     hasil += "\r\n\r\n"
 
-                    connection.sendall(hasil.encode('utf-8'))
-                    logging.info(f"Sent response to {address} (PID:{os.getpid()}): {hasil[:100]}...")
+                    self.connection.sendall(hasil.encode('utf-8'))
+                    logging.info(f"Sent response to {self.address}: {hasil[:50]}...")
+                    
+                    # Update successful operations count only for actual file operations
+                    with self.server_stats['lock']:
+                        self.server_stats['successful_operations'] += 1
+
         except ConnectionResetError:
-            logging.warning(f"Client {address} forcibly disconnected (PID:{os.getpid()}).")
+            logging.warning(f"Client {self.address} forcibly disconnected.")
+            with self.server_stats['lock']:
+                self.server_stats['failed_operations'] += 1
         except Exception as e:
-            logging.error(f"Error processing client {address} (PID:{os.getpid()}): {e}", exc_info=True)
+            logging.error(f"Error processing client {self.address}: {e}", exc_info=True)
+            with self.server_stats['lock']:
+                self.server_stats['failed_operations'] += 1
         finally:
-            logging.warning(f"Closing connection for {address} (PID:{os.getpid()})")
-            connection.close()
+            logging.warning(f"Closing connection for {self.address}")
+            self.connection.close()
+
+class Server(threading.Thread):
+    """
+    Kelas Server menerima koneksi klien dan menyerahkannya ke thread pool.
+    """
+    def __init__(self, ipaddress='0.0.0.0', port=8889, max_workers=10):
+        self.ipinfo = (ipaddress, port)
+        self.my_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.my_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers) # Using ThreadPoolExecutor
+        threading.Thread.__init__(self)
+        self.daemon = True
+        
+        self.server_stats = {
+            'successful_operations': 0,
+            'failed_operations': 0,
+            'lock': threading.Lock() # Lock untuk mengamankan akses ke penghitung
+        }
+
+    def run(self):
+        """
+        Metode run server yang menerima koneksi.
+        """
+        logging.warning(f"Server berjalan di IP address {self.ipinfo[0]} port {self.ipinfo[1]}")
+        try:
+            self.my_socket.bind(self.ipinfo)
+            self.my_socket.listen(5)
+        except Exception as e:
+            logging.critical(f"Failed to start server: {e}")
+            sys.exit(1)
+
+        while True:
+            try:
+                connection, client_address = self.my_socket.accept()
+                logging.warning(f"Koneksi dari {client_address}")
+                
+                handler = ClientHandler(connection, client_address, self.server_stats)
+                self.executor.submit(handler.run)
+            except KeyboardInterrupt:
+                logging.warning("Server dimatikan oleh pengguna.")
+                break
+            except Exception as e:
+                logging.error(f"Error accepting new connection: {e}", exc_info=True)
+        
+        self.executor.shutdown(wait=True)
+        self.my_socket.close()
+        
+        logging.warning("========================================")
+        logging.warning("STATISTIK OPERASI SERVER AKHIR:")
+        with self.server_stats['lock']:
+            logging.warning(f"  Total Operasi Sukses: {self.server_stats['successful_operations']}")
+            logging.warning(f"  Total Operasi Gagal: {self.server_stats['failed_operations']}")
+        logging.warning("========================================")
+        logging.warning("Server berhenti.")
+
 
 def main():
-    ipaddress = '0.0.0.0'
-    port = 6666
-    max_workers = os.cpu_count() if os.cpu_count() else 4 
-
-    logging.warning(f"Server berjalan di IP address {ipaddress} port {port} (Main PID:{os.getpid()})")
-    
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    """
+    Fungsi utama untuk menjalankan server.
+    """
+    svr = Server(ipaddress='0.0.0.0', port=6666, max_workers=50)
+    svr.start()
     
     try:
-        server_socket.bind((ipaddress, port))
-        server_socket.listen(5)
-    except Exception as e:
-        logging.critical(f"Gagal memulai server: {e} (Main PID:{os.getpid()})")
-        sys.exit(1)
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.warning("Main thread dimatikan.")
+        sys.exit(0)
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        logging.warning(f"Process Pool Executor dengan {max_workers} worker dimulai (Main PID:{os.getpid()}).")
-        try:
-            while True:
-                connection, client_address = server_socket.accept()
-                logging.warning(f"Koneksi baru diterima dari {client_address} (Main PID:{os.getpid()})")
-                 
-                # Pass the file descriptor to the worker
-                executor.submit(ClientHandler().run, connection.fileno(), client_address)
-                 
-                # Crucially, close the connection in the main process IMMEDIATELY
-                # after submitting its file descriptor to the worker.
-                # This transfers ownership of the socket to the worker process.
-                connection.close()
-
-        except KeyboardInterrupt:
-            logging.warning("Server dimatikan oleh pengguna (Main PID:{os.getpid()}).")
-        except Exception as e:
-            logging.error(f"Error saat menerima koneksi baru (Main PID:{os.getpid()}): {e}", exc_info=True)
-        finally:
-            logging.warning("Menunggu semua tugas di Process Pool Executor selesai...")
-            # This 'pass' can be removed if you don't need any specific cleanup here
-            pass
-
-    server_socket.close()
-    logging.warning("Server berhenti (Main PID:{os.getpid()}).")
 
 if __name__ == "__main__":
     main()

@@ -110,7 +110,7 @@ def main():
     Fungsi utama untuk menjalankan server.
     """
     # Anda bisa mengatur port di sini
-    svr = Server(ipaddress='0.0.0.0', port=6666, max_workers=20) # Contoh dengan 20 worker thread
+    svr = Server(ipaddress='0.0.0.0', port=6666, max_workers=50) # Contoh dengan 20 worker thread
     svr.start()
     
     # Menjaga main thread tetap hidup agar server daemon thread bisa berjalan
